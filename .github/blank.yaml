@@ -1,0 +1,92 @@
+name: Stateless S2S token leak test
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch_name:
+        description: 'Prefix for the branch that will contain the leaked token'
+        required: true
+        default: 'leak-test'
+
+permissions:
+  contents: write
+
+jobs:
+  leak-token:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Inspect token shape
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Stateless format: ghs_<digits>_<base64url>.<base64url>.<base64url>
+          # Stateful  format: ghs_<random>
+          PREFIX=$(printf '%s' "$GH_TOKEN" | cut -c1-4)
+          UNDERSCORES=$(printf '%s' "$GH_TOKEN" | tr -cd '_' | wc -c)
+          DOTS=$(printf '%s' "$GH_TOKEN" | tr -cd '.' | wc -c)
+          LENGTH=$(printf '%s' "$GH_TOKEN" | wc -c)
+
+          echo "prefix:       $PREFIX"
+          echo "length:       $LENGTH"
+          echo "underscores:  $UNDERSCORES   (stateless expects >= 2)"
+          echo "dots:         $DOTS          (stateless JWT expects 2)"
+
+          if [ "$UNDERSCORES" -ge 2 ] && [ "$DOTS" -eq 2 ]; then
+            echo "::notice::GITHUB_TOKEN looks like a stateless S2S token (ghs_<appid>_<JWT>)"
+          else
+            echo "::warning::GITHUB_TOKEN does not look stateless. The Actions"
+            echo "::warning::integration may not yet be in the stateless rollout for"
+            echo "::warning::this org/enterprise. Secret scanning should still detect"
+            echo "::warning::stateful ghs_ tokens, but this won't exercise the new code path."
+          fi
+
+      - name: Create branch
+        run: |
+          BRANCH="${{ github.event.inputs.branch_name }}-${{ github.run_id }}"
+          echo "BRANCH=$BRANCH" >> "$GITHUB_ENV"
+          git checkout -b "$BRANCH"
+
+      - name: Write token to a committed file
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p leaked-tokens
+          OUTFILE="leaked-tokens/stateless-s2s-${{ github.run_id }}.env"
+          # File contents are NOT redacted by Actions, so the real token lands on disk.
+          printf 'STATELESS_S2S_TOKEN=%s\n' "$GH_TOKEN" > "$OUTFILE"
+
+          # Sanity check: confirm the file actually contains a ghs_ token.
+          # (We grep-print the prefix only; the full token would be redacted in logs.)
+          if grep -q '^STATELESS_S2S_TOKEN=ghs_' "$OUTFILE"; then
+            echo "Wrote a ghs_ token to $OUTFILE"
+          else
+            echo "::error::Failed to write a ghs_ token to $OUTFILE"
+            exit 1
+          fi
+
+      - name: Commit and push leaked token
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add leaked-tokens/
+          git commit -m "test: leak stateless S2S token to trigger secret scanning"
+          # If push protection is enabled this will fail with a 422 / blocked-secret
+          # error. To complete the detection test, either disable push protection
+          # for this repo or use the "Allow secret" bypass URL printed in the
+          # push error output and re-run this workflow.
+          git push --set-upstream origin "$BRANCH"
+
+      - name: Summary
+        run: |
+          echo "Branch pushed:           $BRANCH"
+          echo "File containing leak:    leaked-tokens/stateless-s2s-${{ github.run_id }}.env"
+          echo ""
+          echo "Next steps:"
+          echo "  1. Visit the Security tab > Secret scanning alerts on this repo."
+          echo "  2. You should see a new 'GitHub App server-to-server token' alert"
+          echo "     pointing at the file above on branch $BRANCH."
+          echo "  3. If no alert appears, confirm secret scanning is enabled on this"
+          echo "     repo (Settings > Code security and analysis)."
